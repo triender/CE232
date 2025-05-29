@@ -1,0 +1,15 @@
+# Ignore everything by default
+*
+
+# --- EXCEPTIONS ---
+# Do NOT ignore LPR.py
+!LPR.py
+
+# Do NOT ignore the .gitignore file itself
+!.gitignore
+
+# Do NOT ignore README.md 
+!README.md file
+
+# Do NOT ignore Requirements.txt
+!Requirements.txt
