@@ -11,5 +11,5 @@
 # Do NOT ignore README.md 
 !README.md file
 
-# Do NOT ignore Requirements.txt
-!Requirements.txt
+# Do NOT ignore requirements.txt
+!requirements.txt
