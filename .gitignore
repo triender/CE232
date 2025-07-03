@@ -125,6 +125,7 @@ node_modules/
 .env.development.local
 .env.test.local
 .env.production.local
+!.env.example
 config.ini
 secrets.json
 
@@ -178,6 +179,10 @@ lp_image.py
 
 # Documentation build
 docs/_build/
+!INSTALLATION.md
+!USER_MANUAL.md
+!CODE_CLEANUP.md
+!GIT_MANAGEMENT.md
 
 # Temporary files
 *.tmp

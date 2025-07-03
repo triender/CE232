@@ -76,7 +76,7 @@ def log_error(message: str, category: str = "GENERAL", exception_obj: Exception 
 
 
 def _blink_led_target() -> None:
-    """Hàm mục tiêu cho luồng LED. Bật LED, đợi, sau đó tắt."""
+    """LED thread target function."""
     try:
         GPIO.output(GREEN_LED_PIN, GPIO.HIGH)
         print("🟢 [LED] Đèn xanh BẬT (Thành công)")
@@ -86,7 +86,7 @@ def _blink_led_target() -> None:
         print("🟢 [LED] Đèn xanh TẮT")
 
 def blink_success_led() -> None:
-    """Bắt đầu một luồng mới để chớp đèn LED xanh trong 2 giây."""
+    """Start new thread to blink green LED for 2 seconds."""
     led_thread = threading.Thread(target=_blink_led_target)
     led_thread.daemon = True
     led_thread.start()
@@ -94,8 +94,7 @@ def blink_success_led() -> None:
 
 def live_view_capture_thread(cap) -> None:
     """
-    A thread that continuously captures frames from the camera and saves it
-    to a temporary file for the web view.
+    Thread for continuous camera frame capture and save to temporary file for web view.
     """
     output_path = os.path.join(TMP_DIR, "live_view.jpg")
     print(f"🖼️  [LiveView] Luồng xem trực tiếp đã bắt đầu. Sẽ lưu ảnh vào: {output_path}")
@@ -147,7 +146,7 @@ except ImportError:
             return "unknown"            helper = MockHelper()
 
 def validate_environment_variables() -> bool:
-    """Kiểm tra các biến môi trường cần thiết."""
+    """Check required environment variables."""
     required_vars = [API_ENDPOINT, DB_FILE, IMAGE_DIR, PICTURE_OUTPUT_DIR, 
                      YOLOV5_REPO_PATH, LP_DETECTOR_MODEL_PATH, LP_OCR_MODEL_PATH]
     if not all(required_vars):
@@ -157,12 +156,12 @@ def validate_environment_variables() -> bool:
     return True
 
 def init_db() -> None:
-    """Khởi tạo cơ sở dữ liệu SQLite."""
+    """Initialize SQLite database."""
     with DB_ACCESS_LOCK:
         with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
             cursor = conn.cursor()
-            # Cho phép image_path_in và image_path_out có thể NULL
-            # để xử lý các trường hợp không có ảnh (ví dụ: force_out từ web hoặc lỗi chụp ảnh)
+            # Allow image_path_in and image_path_out to be NULL
+            # to handle cases without images (e.g.: force_out from web or photo capture errors)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS parking_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, 
@@ -183,30 +182,30 @@ def init_db() -> None:
 
 def send_event_to_server(event_payload: dict, image_data_bytes: bytes = None) -> str:
     """
-    Gửi một đối tượng sự kiện hoàn chỉnh đến endpoint của server.
-    Đã được cập nhật để tương thích với Express/Multer phía server.
+    Send complete event object to server endpoint.
+    Updated for Express/Multer compatibility on server side.
     """
     log_identifier = event_payload.get('device_db_id') or event_payload.get('timestamp')
     print(f"📡 [Network] Chuẩn bị gửi sự kiện: ID/Time {log_identifier}, Type: {event_payload.get('event_type')}")
 
-    # Server controller (Node.js/Express) mong muốn các trường riêng lẻ trong form-data,
-    # không phải là một chuỗi JSON duy nhất.
-    # Đổi tên 'rfid_token' thành 'token' để khớp với server.
+    # Server controller (Node.js/Express) expects individual fields in form-data,
+    # not a single JSON string.
+    # Rename 'rfid_token' to 'token' to match server.
     if 'rfid_token' in event_payload:
         event_payload['token'] = event_payload.pop('rfid_token')
 
     files_payload = {}
     if image_data_bytes:
-        # Khi có ảnh, request sẽ là multipart/form-data.
-        # `requests` sẽ tự động xử lý việc đặt `event_payload` vào các trường data.
+        # When there's an image, request will be multipart/form-data.
+        # `requests` will automatically handle putting `event_payload` into data fields.
         files_payload['image'] = (f"img_{log_identifier}.jpg", image_data_bytes, 'image/jpeg')
     
     try:
         if image_data_bytes:
-            # Gửi dưới dạng multipart/form-data
+            # Send as multipart/form-data
             response = requests.post(API_ENDPOINT, data=event_payload, files=files_payload, timeout=(5, 20))
         else:
-            # Gửi dưới dạng application/json
+            # Send as application/json
             response = requests.post(API_ENDPOINT, json=event_payload, timeout=(5, 15))
 
         if 200 <= response.status_code < 300:
@@ -255,15 +254,15 @@ def sync_offline_data_to_server():
                         image_filename = record['image_path_out'] if is_out_event else record['image_path_in']
                         
                         image_bytes = None
-                        # SỬA LỖI: Xử lý trường hợp không có ảnh (ví dụ: force_out từ web)
+                        # FIX: Handle cases without images (e.g.: force_out from web)
                         if image_filename:
                             full_image_path = os.path.join(PICTURE_OUTPUT_DIR, image_filename)
                             if not os.path.exists(full_image_path):
                                 log_error(f"SyncDB: File ảnh không tồn tại {full_image_path} cho log ID {record['id']}. Đánh dấu là không hợp lệ.", category="SYNC/FS")
-                                # Đánh dấu đã đồng bộ để không thử lại một bản ghi không có ảnh
+                                # Mark as synced to avoid retrying a record without image
                                 conn.execute("UPDATE parking_log SET status = ?, synced_to_server = 1 WHERE id = ?", (STATUS_INVALID, record['id']))
                                 conn.commit()
-                                SYNC_WORK_AVAILABLE.set() # Tiếp tục kiểm tra công việc khác
+                                SYNC_WORK_AVAILABLE.set() # Continue checking other work
                                 continue
 
                             try:
@@ -271,12 +270,12 @@ def sync_offline_data_to_server():
                                     image_bytes = img_file.read()
                             except IOError as e_io:
                                 log_error(f"SyncDB: Lỗi IO khi đọc ảnh {full_image_path} cho ID {record['id']}: {e_io}", category="SYNC/FS", exception_obj=e_io)
-                                SYNC_WORK_AVAILABLE.clear() # Đợi trước khi thử lại đọc file
+                                SYNC_WORK_AVAILABLE.clear() # Wait before retrying file read
                                 continue
                         else:
                             print(f"   [SyncDB] Không có file ảnh liên kết với bản ghi ID: {record['id']}. Vẫn sẽ gửi sự kiện không có ảnh.")
 
-                        # Xây dựng payload sự kiện
+                        # Build event payload
                         event_payload = {
                             "uid": UID,
                             "plate": record['plate'],
@@ -290,7 +289,7 @@ def sync_offline_data_to_server():
 
                         result = send_event_to_server(event_payload, image_bytes)
 
-                        # Trạng thái 'already_synced' không còn phù hợp vì server mới là stateless
+                        # Status 'already_synced' no longer applicable as new server is stateless
                         if result == 'success':
                             conn.execute("UPDATE parking_log SET synced_to_server = 1 WHERE id = ?", (record['id'],))
                             conn.commit()
@@ -315,7 +314,7 @@ def sync_offline_data_to_server():
 
 def sync_failure_logs_to_server():
     """
-    A dedicated thread to read failure events from access_log.jsonl and send them to the server.
+    Dedicated thread to read failure events from access_log.jsonl and send them to server.
     """
     while True:
         try:
