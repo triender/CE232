@@ -13,3 +13,43 @@
 
 # Do NOT ignore requirements.txt
 !requirements.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*build/
+*dist/
+*.egg-info/
+ai_env/
+venv/
+.venv/
+
+# Logs & Data
+*.log
+*.jsonl
+error_log.txt
+access_log.jsonl
+parking_data.db
+parking_data.db.lock
+log_sync.state
+
+# Generated files
+tmp/
+picture/
+offline_images/
+
+# AI Models - These are typically large and should not be in git
+model/*.pt
+
+# External libraries
+yolov5/
+
+# Environment variables
+.env
+.env.*
+
+# IDE / Editor specific
+.vscode/
+.idea/

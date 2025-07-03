@@ -11,10 +11,11 @@ import threading
 from dotenv import load_dotenv
 import json
 import traceback
+from filelock import FileLock
 
 # --- CẤU HÌNH VÀ HẰNG SỐ ---
 load_dotenv()
-API_ENDPOINT = os.getenv("API_ENDPOINT", "http://localhost:3000/parking/add")
+API_ENDPOINT = os.getenv("API_ENDPOINT", "http://localhost:3000/api/events/submit") # SỬA LỖI: Cập nhật endpoint chính xác
 UID = os.getenv("UID")
 DB_FILE = os.getenv("DB_FILE", "parking_data.db")
 IMAGE_DIR = os.getenv("IMAGE_DIR", "offline_images")
@@ -22,34 +23,50 @@ PICTURE_OUTPUT_DIR = os.getenv("PICTURE_OUTPUT_DIR", "picture")
 YOLOV5_REPO_PATH = os.getenv("YOLOV5_REPO_PATH")
 LP_DETECTOR_MODEL_PATH = os.getenv("LP_DETECTOR_MODEL_PATH")
 LP_OCR_MODEL_PATH = os.getenv("LP_OCR_MODEL_PATH")
+TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 
 ACCESS_LOG_FILE = "access_log.jsonl"
 ERROR_LOG_FILE = "error_log.txt"
+LOG_SYNC_STATE_FILE = "log_sync.state"
 
 STATUS_INSIDE = 1
 STATUS_COMPLETED = 2
 STATUS_INVALID = 99
-STATUS_MAP_TO_SERVER_API = { STATUS_INSIDE: 0, STATUS_COMPLETED: 1 }
-STATUS_MAP_TO_STRING = { STATUS_INSIDE: 'INSIDE', STATUS_COMPLETED: 'COMPLETED', STATUS_INVALID: 'INVALID' }
+# STATUS_MAP_TO_SERVER_API is no longer needed with the new event-based API
+# STATUS_MAP_TO_SERVER_API = { STATUS_INSIDE: 0, STATUS_COMPLETED: 1 }
+# STATUS_MAP_TO_STRING = { STATUS_INSIDE: 'INSIDE', 'COMPLETED': 'COMPLETED', 'INVALID': 'INVALID' } # Không còn sử dụng
 
-DB_ACCESS_LOCK = threading.Lock()
+DB_LOCK_FILE = DB_FILE + ".lock"
+DB_ACCESS_LOCK = FileLock(DB_LOCK_FILE, timeout=15)
+CAMERA_LOCK = threading.Lock()
 VEHICLE_EVENT = threading.Event()
 SYNC_WORK_AVAILABLE = threading.Event()
+FAILURE_LOG_SYNC_AVAILABLE = threading.Event()
+LIVE_VIEW_THREAD_RUNNING = threading.Event()
+
+# --- Cài đặt GPIO ---
+GREEN_LED_PIN = 16
 
 # --- LOGGING FUNCTIONS ---
-def log_access(event_type, plate, rfid, status_event, image_paths_event: dict, timestamp_event, details=""): # MODIFIED
+def log_access(event_type, plate, rfid, status_event, image_paths_event: dict, timestamp_event, details="", db_id=None):
     log_entry = {
         "timestamp": timestamp_event,
-        "event_type": event_type,  # "IN", "OUT", "FAIL_IN", "FAIL_OUT"
+        "event_type": event_type,
         "plate": plate,
         "rfid_token": str(rfid),
-        "status_event": status_event, # e.g. "SUCCESS", "PLATE_MISMATCH", "ALREADY_INSIDE", "NO_PLATE_DETECTED"
-        "image_paths": image_paths_event, # MODIFIED from "image_path" to "image_paths"
-        "details": details
+        "status_event": status_event,
+        "image_paths": image_paths_event,
+        "details": details,
+        "device_db_id": db_id
     }
     try:
         with open(ACCESS_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        
+        # Trigger the failure log sync if it's a failure event
+        if event_type.startswith("FAIL"):
+            FAILURE_LOG_SYNC_AVAILABLE.set()
+
     except Exception as e:
         print(f"🔥 [LogAccess] Failed to write to access log: {e}")
 
@@ -62,6 +79,59 @@ def log_error(message, category="GENERAL", exception_obj=None):
                 f.write("-" * 50 + "\n")
     except Exception as e:
         print(f"🔥 [LogError] Failed to write to error log: {e}")
+
+
+def _blink_led_target():
+    """Hàm mục tiêu cho luồng LED. Bật LED, đợi, sau đó tắt."""
+    try:
+        GPIO.output(GREEN_LED_PIN, GPIO.HIGH)
+        print("🟢 [LED] Đèn xanh BẬT (Thành công)")
+        time.sleep(2)
+    finally:
+        GPIO.output(GREEN_LED_PIN, GPIO.LOW)
+        print("🟢 [LED] Đèn xanh TẮT")
+
+def blink_success_led():
+    """Bắt đầu một luồng mới để chớp đèn LED xanh trong 2 giây."""
+    led_thread = threading.Thread(target=_blink_led_target)
+    led_thread.daemon = True
+    led_thread.start()
+
+
+def live_view_capture_thread(cap):
+    """
+    A thread that continuously captures frames from the camera and saves it
+    to a temporary file for the web view.
+    """
+    output_path = os.path.join(TMP_DIR, "live_view.jpg")
+    print(f"🖼️  [LiveView] Luồng xem trực tiếp đã bắt đầu. Sẽ lưu ảnh vào: {output_path}")
+    while LIVE_VIEW_THREAD_RUNNING.is_set():
+        try:
+            with CAMERA_LOCK:
+                if not cap.isOpened():
+                    print("🖼️  [LiveView] Cảnh báo: Camera không mở.")
+                    time.sleep(0.5)
+                    continue
+                ret, frame = cap.read()
+
+            if ret:
+                is_success, im_buf_arr = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if is_success:
+                    tmp_output_path = output_path + ".tmp"
+                    with open(tmp_output_path, "wb") as f:
+                        f.write(im_buf_arr)
+                    os.rename(tmp_output_path, output_path)
+                else:
+                    print("🖼️  [LiveView] Cảnh báo: Không thể mã hóa khung hình thành JPEG.")
+            else:
+                print("🖼️  [LiveView] Cảnh báo: Không thể đọc khung hình từ camera (ret=False).")
+
+        except Exception as e:
+            print(f"🖼️  [LiveView] Lỗi Exception: {e}")
+            log_error(f"Lỗi trong luồng xem trực tiếp: {e}", "LIVE_VIEW")
+        
+        time.sleep(0.5)
+
 
 if not all([API_ENDPOINT, DB_FILE, IMAGE_DIR, PICTURE_OUTPUT_DIR, YOLOV5_REPO_PATH, LP_DETECTOR_MODEL_PATH, LP_OCR_MODEL_PATH]):
     print("❌ Lỗi: Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.")
@@ -79,12 +149,9 @@ except ImportError:
         @classmethod
         def read_plate(cls, model, image):
             cls._plate_counter +=1
-            # Giả lập việc đọc biển số khác nhau cho mỗi lần gọi để test lỗi duplicate
-            # return f"MOCKPLATE{int(time.time()*10 % 100) + cls._plate_counter}" 
             if time.time() % 10 > 2:
                  return f"MOCK{int(time.time())%1000 + cls._plate_counter:04d}LP"
-            return "unknown" # Hoặc trả về một biển số cố định để test
-            # return "60B188188" 
+            return "unknown"
     helper = MockHelper()
 
 def get_vietnam_time_object():
@@ -103,10 +170,12 @@ def init_db():
     with DB_ACCESS_LOCK:
         with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
             cursor = conn.cursor()
+            # CẢI TIẾN: Cho phép image_path_in và image_path_out có thể NULL
+            # để xử lý các trường hợp không có ảnh (ví dụ: force_out từ web hoặc lỗi chụp ảnh)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS parking_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, plate TEXT NOT NULL, rfid_token TEXT NOT NULL,
-                    time_in TEXT NOT NULL, time_out TEXT, image_path_in TEXT NOT NULL, image_path_out TEXT,
+                    time_in TEXT NOT NULL, time_out TEXT, image_path_in TEXT, image_path_out TEXT,
                     status INTEGER NOT NULL, synced_to_server INTEGER NOT NULL DEFAULT 0
                 )
             ''')
@@ -114,123 +183,370 @@ def init_db():
     print("✅ [DB] CSDL đã được khởi tạo.")
     os.makedirs(IMAGE_DIR, exist_ok=True)
     os.makedirs(PICTURE_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
 
-def send_data_to_server(uid, log_id, plate_text, token_id, timestamp_str, image_data_bytes, event_status_for_api) -> str:
-    print(f"📡 [Network] Đang thử gửi dữ liệu: ID {log_id}, Biển số {plate_text}, Status API: {event_status_for_api}")
-    # SỬA ĐỔI: Đổi tên key 'status' thành 'in_or_out' để khớp với API của server Node.js
-    payload = { 'uid': uid, 'plate': plate_text, 'token': str(token_id), 'time': timestamp_str, 'in_or_out': event_status_for_api }
-    filename_for_server = f"{sanitize_filename_component(plate_text)}_{log_id}_{int(time.time())}.jpg"
-    files_payload = {'image': (filename_for_server, image_data_bytes, 'image/jpeg')}
+
+def send_event_to_server(event_payload: dict, image_data_bytes: bytes = None) -> str:
+    """
+    Gửi một đối tượng sự kiện hoàn chỉnh đến endpoint của server.
+    Đã được cập nhật để tương thích với Express/Multer phía server.
+    """
+    log_identifier = event_payload.get('device_db_id') or event_payload.get('timestamp')
+    print(f"📡 [Network] Chuẩn bị gửi sự kiện: ID/Time {log_identifier}, Type: {event_payload.get('event_type')}")
+
+    # Server controller (Node.js/Express) mong muốn các trường riêng lẻ trong form-data,
+    # không phải là một chuỗi JSON duy nhất.
+    # Đổi tên 'rfid_token' thành 'token' để khớp với server.
+    if 'rfid_token' in event_payload:
+        event_payload['token'] = event_payload.pop('rfid_token')
+
+    files_payload = {}
+    if image_data_bytes:
+        # Khi có ảnh, request sẽ là multipart/form-data.
+        # `requests` sẽ tự động xử lý việc đặt `event_payload` vào các trường data.
+        files_payload['image'] = (f"img_{log_identifier}.jpg", image_data_bytes, 'image/jpeg')
+    
     try:
-        response = requests.post(API_ENDPOINT, data=payload, files=files_payload, timeout=(5, 20))
+        if image_data_bytes:
+            # Gửi dưới dạng multipart/form-data
+            response = requests.post(API_ENDPOINT, data=event_payload, files=files_payload, timeout=(5, 20))
+        else:
+            # Gửi dưới dạng application/json
+            response = requests.post(API_ENDPOINT, json=event_payload, timeout=(5, 15))
+
         if 200 <= response.status_code < 300:
-            print(f"✅ [Network] Server đã chấp nhận dữ liệu thành công cho ID {log_id}.")
+            print(f"✅ [Network] Server đã chấp nhận sự kiện {log_identifier}.")
             return 'success'
         elif 400 <= response.status_code < 500:
             response_text = response.text
-            print(f"❌ [Network] Server từ chối dữ liệu ID {log_id} không hợp lệ (Mã: {response.status_code}): {response_text}")
-            log_error(f"Server từ chối dữ liệu ID {log_id} không hợp lệ (Mã: {response.status_code}): {response_text}", category="SERVER_RESPONSE")
-            
-            # SỬA ĐỔI: Xử lý thông minh các lỗi cho thấy server đã ở đúng trạng thái
-            if "Xe đã có trong bãi" in response_text or "Xe chưa vào, không thể ra" in response_text:
-                print(f"ℹ️ [Network] Lỗi này cho thấy server đã ở trạng thái đồng bộ. Đánh dấu là đã đồng bộ.")
-                return 'already_synced' # Trạng thái mới để xử lý đặc biệt
-
+            print(f"❌ [Network] Server từ chối sự kiện {log_identifier} (Lỗi Client: {response.status_code}): {response_text}")
+            log_error(f"Server từ chối sự kiện {log_identifier} (Code: {response.status_code}): {response_text}", category="SERVER_RESPONSE")
             return 'permanent_failure'
         else:
-            print(f"❌ [Network] Lỗi phía server khi gửi ID {log_id} (Mã: {response.status_code}).")
-            log_error(f"Lỗi phía server khi gửi ID {log_id} (Mã: {response.status_code}): {response.text}", category="SERVER_RESPONSE")
+            print(f"❌ [Network] Lỗi phía server cho sự kiện {log_identifier} (Code: {response.status_code}).")
+            log_error(f"Lỗi server cho sự kiện {log_identifier} (Code: {response.status_code}): {response.text}", category="SERVER_RESPONSE")
             return 'temporary_failure'
+
     except requests.exceptions.RequestException as e:
-        print(f"❌ [Network] Lỗi kết nối hoặc timeout khi gửi ID {log_id}: {e}.")
-        log_error(f"Lỗi kết nối hoặc timeout khi gửi ID {log_id}", category="NETWORK", exception_obj=e)
+        print(f"❌ [Network] Lỗi kết nối hoặc timeout cho sự kiện {log_identifier}: {e}.")
+        log_error(f"Lỗi kết nối hoặc timeout cho sự kiện {log_identifier}", category="NETWORK", exception_obj=e)
         return 'temporary_failure'
+
 
 def sync_offline_data_to_server():
     while True:
         try:
-            SYNC_WORK_AVAILABLE.wait(timeout=60.0) # Đợi tín hiệu hoặc timeout 60 giây
+            SYNC_WORK_AVAILABLE.wait(timeout=60.0)
             if VEHICLE_EVENT.is_set():
-                time.sleep(0.5) # Nếu có xe đang xử lý, nhường quyền, kiểm tra lại sau
+                time.sleep(0.5)
                 continue
 
-            with DB_ACCESS_LOCK: # Khóa CSDL để thao tác
-                if VEHICLE_EVENT.is_set(): continue # Kiểm tra lại cờ xe sau khi có khóa
+            with DB_ACCESS_LOCK:
+                if VEHICLE_EVENT.is_set(): continue
 
                 with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
-                    # Lấy một bản ghi chưa đồng bộ
                     cursor.execute("SELECT * FROM parking_log WHERE synced_to_server = 0 LIMIT 1")
                     record = cursor.fetchone()
 
                     if record:
-                        print(f"🔄 [Sync] Processing record ID: {record['id']}, Plate: {record['plate']}")
+                        print(f"🔄 [SyncDB] Xử lý bản ghi ID: {record['id']}, Biển số: {record['plate']}")
                         status_int = record['status']
-                        api_status = STATUS_MAP_TO_SERVER_API.get(status_int)
-
-                        # Nếu trạng thái không hợp lệ để gửi lên server API
-                        if api_status is None:
-                            log_error(f"Sync: Invalid status {status_int} for API sync on record ID {record['id']}. Marking as synced.", category="SYNC")
-                            conn.execute("UPDATE parking_log SET synced_to_server = 1 WHERE id = ?", (record['id'],))
-                            conn.commit()
-                            SYNC_WORK_AVAILABLE.set() # Có thể còn việc khác
-                            continue
-
+                        
                         is_out_event = (status_int == STATUS_COMPLETED)
+                        event_type = "OUT" if is_out_event else "IN"
                         timestamp = record['time_out'] if is_out_event else record['time_in']
                         image_filename = record['image_path_out'] if is_out_event else record['image_path_in']
-                        full_image_path = os.path.join(PICTURE_OUTPUT_DIR, image_filename)
+                        
+                        image_bytes = None
+                        # SỬA LỖI: Xử lý trường hợp không có ảnh (ví dụ: force_out từ web)
+                        if image_filename:
+                            full_image_path = os.path.join(PICTURE_OUTPUT_DIR, image_filename)
+                            if not os.path.exists(full_image_path):
+                                log_error(f"SyncDB: File ảnh không tồn tại {full_image_path} cho log ID {record['id']}. Đánh dấu là không hợp lệ.", category="SYNC/FS")
+                                # Đánh dấu đã đồng bộ để không thử lại một bản ghi không có ảnh
+                                conn.execute("UPDATE parking_log SET status = ?, synced_to_server = 1 WHERE id = ?", (STATUS_INVALID, record['id']))
+                                conn.commit()
+                                SYNC_WORK_AVAILABLE.set() # Tiếp tục kiểm tra công việc khác
+                                continue
 
-                        if not os.path.exists(full_image_path):
-                            log_error(f"Sync: Image file not found {full_image_path} for log ID {record['id']}. Marking invalid.", category="SYNC/FS")
-                            conn.execute("UPDATE parking_log SET status = ?, synced_to_server = 1 WHERE id = ?", (STATUS_INVALID, record['id']))
-                            conn.commit()
-                            SYNC_WORK_AVAILABLE.set() # Có thể còn việc khác
-                            continue
+                            try:
+                                with open(full_image_path, 'rb') as img_file:
+                                    image_bytes = img_file.read()
+                            except IOError as e_io:
+                                log_error(f"SyncDB: Lỗi IO khi đọc ảnh {full_image_path} cho ID {record['id']}: {e_io}", category="SYNC/FS", exception_obj=e_io)
+                                SYNC_WORK_AVAILABLE.clear() # Đợi trước khi thử lại đọc file
+                                continue
+                        else:
+                            print(f"   [SyncDB] Không có file ảnh liên kết với bản ghi ID: {record['id']}. Vẫn sẽ gửi sự kiện không có ảnh.")
 
-                        image_bytes = b''
-                        try:
-                            with open(full_image_path, 'rb') as img_file:
-                                image_bytes = img_file.read()
-                        except IOError as e_io:
-                            log_error(f"Sync: IOError reading image {full_image_path} for ID {record['id']}: {e_io}", category="SYNC/FS", exception_obj=e_io)
-                            # Không đánh dấu là đã đồng bộ, sẽ thử lại sau hoặc cần can thiệp thủ công nếu lỗi IO persist
-                            # Cân nhắc: nếu lỗi IO lặp lại nhiều lần, có thể đánh dấu là STATUS_INVALID
-                            # conn.execute("UPDATE parking_log SET status = ?, synced_to_server = 1 WHERE id = ?", (STATUS_INVALID, record['id']))
-                            # conn.commit()
-                            SYNC_WORK_AVAILABLE.clear() # Tạm dừng, đợi xử lý thủ công hoặc lần sau
-                            continue
+                        # Xây dựng payload sự kiện
+                        event_payload = {
+                            "uid": UID,
+                            "plate": record['plate'],
+                            "token": record['rfid_token'],
+                            "timestamp": timestamp,
+                            "event_type": event_type,
+                            "status_event": "SUCCESS",
+                            "details": f"DB_ID: {record['id']}",
+                            "device_db_id": record['id']
+                        }
 
+                        result = send_event_to_server(event_payload, image_bytes)
 
-                        result = send_data_to_server(UID, record['id'], record['plate'], record['rfid_token'], timestamp, image_bytes, api_status)
-
-                        # SỬA ĐỔI: Xử lý kết quả `already_synced` như một thành công
-                        if result == 'success' or result == 'already_synced':
+                        # Trạng thái 'already_synced' không còn phù hợp vì server mới là stateless
+                        if result == 'success':
                             conn.execute("UPDATE parking_log SET synced_to_server = 1 WHERE id = ?", (record['id'],))
                             conn.commit()
-                            print(f"✅ [Sync] Record ID: {record['id']} marked as synced (Result: {result}).")
-                            SYNC_WORK_AVAILABLE.set() # Đã xử lý xong, báo có thể còn việc
+                            print(f"✅ [SyncDB] Record ID: {record['id']} marked as synced.")
+                            SYNC_WORK_AVAILABLE.set() # Check for more work immediately
                         elif result == 'permanent_failure':
-                            # Lỗi vĩnh viễn, đánh dấu đã đồng bộ để không thử lại
                             conn.execute("UPDATE parking_log SET synced_to_server = 1, status = ? WHERE id = ?", (STATUS_INVALID, record['id']))
                             conn.commit()
-                            print(f"🚫 [Sync] Record ID: {record['id']} marked as synced due to permanent failure.")
-                            SYNC_WORK_AVAILABLE.set() # Đã xử lý xong, báo có thể còn việc
+                            print(f"🚫 [SyncDB] Record ID: {record['id']} marked as invalid due to permanent failure.")
+                            SYNC_WORK_AVAILABLE.set()
                         else: # temporary_failure
-                            # Lỗi tạm thời, không làm gì cả, sẽ thử lại sau
-                            print(f"⏳ [Sync] Temporary failure for record ID: {record['id']}. Will retry later.")
-                            SYNC_WORK_AVAILABLE.clear() # Dừng tín hiệu, đợi timeout hoặc sự kiện mới
+                            print(f"⏳ [SyncDB] Temporary failure for record ID: {record['id']}. Will retry later.")
+                            SYNC_WORK_AVAILABLE.clear()
                     else:
-                        # Không có bản ghi nào cần đồng bộ
-                        # print("👍 [Sync] No records to sync.")
-                        SYNC_WORK_AVAILABLE.clear() # Không có việc, xóa tín hiệu
+                        # No more work
+                        SYNC_WORK_AVAILABLE.clear()
         except Exception as e:
-            print(f"🔥 [Sync] Lỗi nghiêm trọng trong luồng đồng bộ: {e}")
-            log_error("Lỗi nghiêm trọng trong luồng đồng bộ", category="SYNC", exception_obj=e)
-            SYNC_WORK_AVAILABLE.clear() # Dừng tín hiệu
-            time.sleep(30) # Nghỉ 30 giây trước khi thử lại vòng lặp
-            # SYNC_WORK_AVAILABLE.set() # Cân nhắc set lại để chủ động thử lại sau khi nghỉ
+            print(f"🔥 [SyncDB] Critical error in sync thread: {e}")
+            log_error("Critical error in DB sync thread", category="SYNC_DB", exception_obj=e)
+            SYNC_WORK_AVAILABLE.clear() # Stop trying on critical error
+            time.sleep(30)
+
+def sync_failure_logs_to_server():
+    """
+    A dedicated thread to read failure events from access_log.jsonl and send them to the server.
+    """
+    while True:
+        try:
+            FAILURE_LOG_SYNC_AVAILABLE.wait(timeout=180.0) # Wait for signal or timeout every 3 mins
+            if VEHICLE_EVENT.is_set():
+                time.sleep(1)
+                continue
+
+            last_pos = 0
+            try:
+                with open(LOG_SYNC_STATE_FILE, "r") as f:
+                    last_pos = int(f.read())
+            except (FileNotFoundError, ValueError):
+                last_pos = 0
+
+            try:
+                with open(ACCESS_LOG_FILE, "r", encoding="utf-8") as f:
+                    f.seek(last_pos)
+                    
+                    while True: # Process all new lines
+                        current_pos = f.tell()
+                        line = f.readline()
+                        if not line:
+                            FAILURE_LOG_SYNC_AVAILABLE.clear() # No more work
+                            break
+
+                        try:
+                            log_entry = json.loads(line)
+                            # Only sync failure events through this mechanism
+                            if log_entry.get("event_type", "").startswith("FAIL"):
+                                print(f"🔄 [SyncLog] Xử lý log lỗi tại vị trí {current_pos}: {log_entry.get('status_event')}")
+                                
+                                # Thêm UID vào log nếu chưa có, đảm bảo server có thể định danh thiết bị
+                                if 'uid' not in log_entry:
+                                    log_entry['uid'] = UID
+
+                                # Hàm này mong muốn một dict, chúng ta đã có sẵn. Không có ảnh cho các sự kiện lỗi.
+                                result = send_event_to_server(log_entry)
+
+                                if result == 'success' or result == 'permanent_failure':
+                                    # Đối với log, ngay cả lỗi vĩnh viễn cũng có nghĩa là không thử lại. Chỉ cần di chuyển con trỏ.
+                                    with open(LOG_SYNC_STATE_FILE, "w") as state_f:
+                                        state_f.write(str(f.tell()))
+                                    print(f"✅ [SyncLog] Log tại vị trí {current_pos} đã được đánh dấu là đã đồng bộ (Kết quả: {result}).")
+                                else: # temporary_failure
+                                    print(f"⏳ [SyncLog] Temporary failure for log at pos {current_pos}. Will retry later.")
+                                    FAILURE_LOG_SYNC_AVAILABLE.clear() # Stop and wait before retrying
+                                    break # Exit the inner while loop
+                        except json.JSONDecodeError:
+                            print(f"⚠️ [SyncLog] Skipping malformed JSON line in access log at pos {current_pos}.")
+                            # Don't update position, just skip the line
+                            with open(LOG_SYNC_STATE_FILE, "w") as state_f:
+                                state_f.write(str(f.tell()))
+
+            except FileNotFoundError:
+                FAILURE_LOG_SYNC_AVAILABLE.clear() # Log file doesn't exist yet
+                continue
+            except Exception as e_inner:
+                 print(f"🔥 [SyncLog] Error processing log file: {e_inner}")
+                 log_error("Error processing log file in sync thread", "SYNC_LOG", e_inner)
+                 FAILURE_LOG_SYNC_AVAILABLE.clear()
+                 time.sleep(30)
+
+        except Exception as e:
+            print(f"🔥 [SyncLog] Critical error in failure log sync thread: {e}")
+            log_error("Critical error in failure log sync thread", category="SYNC_LOG", exception_obj=e)
+            FAILURE_LOG_SYNC_AVAILABLE.clear()
+            time.sleep(30)
+
+
+def _save_vehicle_images(base_filename_part, event_type, original_frame, cropped_frame=None):
+    """
+    Hàm helper để lưu ảnh gốc và ảnh cắt vào thư mục picture.
+    Tránh lặp lại code và làm cho logic xử lý VÀO/RA gọn gàng hơn.
+    Trả về một dict chứa tên các file ảnh đã lưu.
+    """
+    timestamp_fn = get_vietnam_time_for_filename()
+    base_fn = f"{event_type}_{timestamp_fn}_{sanitize_filename_component(base_filename_part)}"
+    
+    raw_image_filename = f"raw_{base_fn}.jpg"
+    # Chỉ tạo tên file crop nếu có ảnh crop thực sự
+    crop_image_filename = f"crop_{base_fn}.jpg" if cropped_frame is not None and cropped_frame.size > 0 else None
+
+    image_paths = {"raw": None, "crop": None}
+
+    try:
+        raw_path_viewer = os.path.join(PICTURE_OUTPUT_DIR, raw_image_filename)
+        cv2.imwrite(raw_path_viewer, original_frame)
+        image_paths["raw"] = raw_image_filename
+        print(f"🖼️  [FS] Đã lưu ảnh {event_type.upper()} (gốc): {raw_path_viewer}")
+
+        if crop_image_filename:
+            crop_path_viewer = os.path.join(PICTURE_OUTPUT_DIR, crop_image_filename)
+            cv2.imwrite(crop_path_viewer, cropped_frame)
+            image_paths["crop"] = crop_image_filename
+            print(f"🖼️  [FS] Đã lưu ảnh {event_type.upper()} (biển số): {crop_path_viewer}")
+            
+    except Exception as e_img:
+        print(f"❌ [FS] Lỗi khi lưu ảnh {event_type.upper()}: {e_img}")
+        log_error(f"Lỗi khi lưu ảnh {event_type.upper()} (Plate: {base_filename_part})", category="FILESYSTEM", exception_obj=e_img)
+
+    return image_paths
+
+def _process_vehicle_event(rfid_id, cap):
+    """
+    Hàm này đóng gói toàn bộ logic xử lý cho một sự kiện xe, từ lúc quẹt thẻ đến giao dịch CSDL.
+    Được gọi từ vòng lặp chính để giữ cho vòng lặp gọn gàng.
+    """
+    print("📸 [Main] Bắt đầu chụp ảnh và nhận dạng biển số...")
+    with CAMERA_LOCK:
+        for _ in range(5): cap.read() # Xả buffer để lấy khung hình mới nhất
+        ret, live_frame = cap.read()
+
+    if not ret or live_frame is None:
+        print("❌ [Main] Không thể lấy khung hình từ camera.")
+        log_error("Không thể lấy khung hình từ camera trong vòng lặp chính.", category="CAMERA")
+        return
+
+    # Tối ưu hóa: Di chuyển phần xử lý AI tốn thời gian ra ngoài DB Lock
+    print("📸 [AI] Đang xử lý ảnh để nhận dạng biển số (ngoài DB Lock)...")
+    original_frame_to_save = live_frame.copy()
+    plate_detection_results = yolo_LP_detect(live_frame.copy(), size=640)
+    detected_coords_list = plate_detection_results.pandas().xyxy[0].values.tolist()
+    
+    cropped_license_plate_img = None
+    if detected_coords_list:
+        # Sắp xếp các biển số phát hiện được theo diện tích giảm dần và lấy cái lớn nhất
+        detected_coords_list.sort(key=lambda x: (x[2]-x[0])*(x[3]-x[1]), reverse=True)
+        x1, y1, x2, y2 = map(int, detected_coords_list[0][:4])
+        # Đảm bảo tọa độ cắt nằm trong kích thước ảnh
+        y1, y2 = max(0, y1), min(original_frame_to_save.shape[0], y2)
+        x1, x2 = max(0, x1), min(original_frame_to_save.shape[1], x2)
+        if y2 > y1 and x2 > x1:
+            cropped_license_plate_img = original_frame_to_save[y1:y2, x1:x2]
+            found_license_plate_text = helper.read_plate(yolo_license_plate, cropped_license_plate_img.copy())
+        else: # Nếu tọa độ không hợp lệ, dùng ảnh gốc
+            found_license_plate_text = helper.read_plate(yolo_license_plate, live_frame.copy())
+    else: # Nếu không phát hiện được biển số, dùng ảnh gốc
+        found_license_plate_text = helper.read_plate(yolo_license_plate, live_frame.copy())
+    
+    normalized_plate = normalize_plate(found_license_plate_text)
+
+    # Sau khi có biển số, mới vào DB Lock để xử lý logic
+    with DB_ACCESS_LOCK:
+        try:
+            print(f"   [Main] Đã giành được khóa CSDL. Bắt đầu xử lý logic cho thẻ ID: {rfid_id}")
+            with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM parking_log WHERE rfid_token = ? AND status = ?", (str(rfid_id), STATUS_INSIDE))
+                vehicle_inside_record = cursor.fetchone()
+
+            # KIỂM TRA BIỂN SỐ
+            if not normalized_plate or normalized_plate == "UNKNOWN":
+                print("❌ [AI] Không nhận dạng được biển số hợp lệ.")
+                log_error(f"Không nhận dạng được biển số hợp lệ. RFID: {rfid_id}, Raw Plate: {found_license_plate_text}", category="AI/VALIDATION")
+                # Không lưu ảnh vì không có biển số để đặt tên file
+                log_access("FAIL_IN" if vehicle_inside_record is None else "FAIL_OUT", found_license_plate_text, rfid_id, "NO_PLATE_DETECTED", {}, get_vietnam_time_str())
+                return # Kết thúc xử lý cho sự kiện này
+
+            print(f"🎉 [AI] Phát hiện biển số: '{found_license_plate_text}' -> Chuẩn hóa: '{normalized_plate}'")
+
+            # --- LOGIC XỬ LÝ VÀO/RA ---
+            # XE VÀO
+            if vehicle_inside_record is None:
+                print("➡️  [Logic] Xử lý luồng VÀO...")
+                with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id FROM parking_log WHERE plate = ? AND status = ?", (normalized_plate, STATUS_INSIDE))
+                    is_plate_already_inside = cursor.fetchone()
+                
+                if is_plate_already_inside:
+                    print(f"🚨 [Logic] Xác thực THẤT BẠI: Biển số '{normalized_plate}' đã được ghi nhận ở trong bãi với một thẻ khác.")
+                    log_error(f"Xác thực THẤT BẠI VÀO: Biển số '{normalized_plate}' (RFID: {rfid_id}) đã ở trong bãi với thẻ khác.", category="LOGIC/VALIDATION")
+                    image_paths = _save_vehicle_images(normalized_plate, "in_fail", original_frame_to_save, cropped_license_plate_img)
+                    log_access("FAIL_IN", normalized_plate, rfid_id, "ALREADY_INSIDE_DIFF_RFID", image_paths, get_vietnam_time_str(), details="Plate already inside with different RFID")
+                else:
+                    print(f"✅ [Logic] Xác thực THÀNH CÔNG: Biển số '{normalized_plate}' hợp lệ để vào.")
+                    current_time_str = get_vietnam_time_str()
+                    image_paths = _save_vehicle_images(normalized_plate, "in", original_frame_to_save, cropped_license_plate_img)
+                    
+                    with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("INSERT INTO parking_log (plate, rfid_token, time_in, image_path_in, status, synced_to_server) VALUES (?, ?, ?, ?, ?, ?)",
+                                        (normalized_plate, str(rfid_id), current_time_str, image_paths.get("raw"), STATUS_INSIDE, 0))
+                        last_id = cursor.lastrowid
+                        conn.commit()
+                        print(f"💾 [DB] Sự kiện VÀO đã được lưu cục bộ. ID: {last_id}")
+                        log_access("IN", normalized_plate, rfid_id, "SUCCESS", image_paths, current_time_str, details=f"DB_ID: {last_id}", db_id=last_id)
+                        blink_success_led()
+
+            # XE RA
+            else:
+                print("⬅️  [Logic] Xử lý luồng RA...")
+                plate_in_db = vehicle_inside_record['plate']
+                db_id_in = vehicle_inside_record['id']
+                current_time_str = get_vietnam_time_str()
+                
+                # Luôn lưu ảnh khi xe ra để có bằng chứng
+                image_paths = _save_vehicle_images(normalized_plate, "out", original_frame_to_save, cropped_license_plate_img)
+
+                if normalized_plate != plate_in_db:
+                    print(f"🚨 [Logic] Cảnh báo An ninh: Biển số ra '{normalized_plate}' KHÔNG KHỚP biển số vào '{plate_in_db}'. Từ chối cho ra.")
+                    log_error(f"Cảnh báo An ninh RA: Biển số ra '{normalized_plate}' (RFID: {rfid_id}) KHÔNG KHỚP biển vào '{plate_in_db}'.", category="LOGIC/SECURITY")
+                    log_access("FAIL_OUT", normalized_plate, rfid_id, "PLATE_MISMATCH", image_paths, current_time_str, details=f"Plate mismatch. DB plate: {plate_in_db}", db_id=db_id_in)
+                else:
+                    print(f"✅ [Logic] Xác thực THÀNH CÔNG: Biển số '{normalized_plate}' khớp. Cho phép xe ra.")
+                    with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE parking_log SET time_out = ?, image_path_out = ?, status = ?, synced_to_server = ? WHERE id = ?",
+                                        (current_time_str, image_paths.get("raw"), STATUS_COMPLETED, 0, db_id_in))
+                        conn.commit()
+                        print(f"💾 [DB] Sự kiện RA đã được cập nhật cục bộ cho ID: {db_id_in}")
+                        log_access("OUT", normalized_plate, rfid_id, "SUCCESS", image_paths, current_time_str, details=f"DB_ID: {db_id_in}", db_id=db_id_in)
+                        blink_success_led()
+            
+            # Sau mỗi sự kiện, dù thành công hay thất bại, đều trigger luồng sync
+            SYNC_WORK_AVAILABLE.set()
+
+        except Exception as e_txn:
+            print(f"🔥 [Main] Lỗi nghiêm trọng trong giao dịch CSDL: {e_txn}")
+            log_error("Lỗi nghiêm trọng trong giao dịch CSDL", category="DB_TRANSACTION", exception_obj=e_txn)
+        finally:
+            print("   [Main] Hoàn tất xử lý logic. Giải phóng khóa CSDL.")
+
+
 # --- KHỞI TẠO HỆ THỐNG ---
 print("🚀 [Main] Bắt đầu khởi tạo hệ thống...")
 init_db()
@@ -243,9 +559,18 @@ try:
     print("   [HW] Khởi tạo camera...")
     cap = cv2.VideoCapture(0)
     if not cap.isOpened(): raise IOError("Không thể mở webcam")
+    
+    print("   [HW] Khởi tạo chân GPIO...")
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+    
     print("   [HW] Khởi tạo đầu đọc RFID...")
     reader = SimpleMFRC522()
-    print("✅ [Main] Model AI, Camera và Đầu đọc RFID đã được khởi tạo thành công!")
+
+    GPIO.setup(GREEN_LED_PIN, GPIO.OUT)
+    GPIO.output(GREEN_LED_PIN, GPIO.LOW) # Đảm bảo đèn tắt khi khởi động
+
+    print("✅ [Main] Model AI, Camera, GPIO và Đầu đọc RFID đã được khởi tạo thành công!")
 except Exception as e:
     print(f"🔥 [Main] LỖI NGHIÊM TRỌNG khi khởi tạo: {e}")
     log_error("LỖI NGHIÊM TRỌNG khi khởi tạo hệ thống", category="INITIALIZATION", exception_obj=e)
@@ -253,17 +578,37 @@ except Exception as e:
 
 VEHICLE_EVENT.clear()
 SYNC_WORK_AVAILABLE.clear()
+FAILURE_LOG_SYNC_AVAILABLE.clear()
 with DB_ACCESS_LOCK:
     with sqlite3.connect(DB_FILE) as conn:
         if conn.execute("SELECT 1 FROM parking_log WHERE synced_to_server = 0 LIMIT 1").fetchone():
-            print("   [Main] Phát hiện dữ liệu cũ chưa đồng bộ. Bật tín hiệu cho luồng sync.")
+            print("   [Main] Phát hiện dữ liệu cũ chưa đồng bộ. Bật tín hiệu cho luồng sync DB.")
             SYNC_WORK_AVAILABLE.set()
+
+# Check for unsynced failure logs on startup
+try:
+    if os.path.exists(ACCESS_LOG_FILE):
+        print("   [Main] Kiểm tra file log lỗi chưa đồng bộ...")
+        FAILURE_LOG_SYNC_AVAILABLE.set()
+except Exception as e:
+    print(f"   [Main] Không thể kiểm tra file log lỗi: {e}")
+
 
 sync_thread = threading.Thread(target=sync_offline_data_to_server, daemon=True)
 sync_thread.start()
-print("🚀 [Main] Đã khởi động luồng đồng bộ theo tín hiệu.")
+print("🚀 [Main] Đã khởi động luồng đồng bộ CSDL theo tín hiệu.")
 
-# --- VÒNG LẶP CHÍNH CỦA ỨNG DỤNG ---
+failure_sync_thread = threading.Thread(target=sync_failure_logs_to_server, daemon=True)
+failure_sync_thread.start()
+print("🚀 [Main] Đã khởi động luồng đồng bộ file log lỗi.")
+
+# --- LIVE VIEW THREAD ---
+print("🚀 [Main] Khởi động luồng xem camera trực tiếp...")
+LIVE_VIEW_THREAD_RUNNING.set()
+live_view_thread = threading.Thread(target=live_view_capture_thread, args=(cap,), daemon=True)
+live_view_thread.start()
+
+# --- VÒNG LẶP CHÍNH CỦA ỨNG DỤNG (ĐÃ ĐƯỢC TÁI CẤU TRÚC) ---
 print("✅ [Main] Hệ thống sẵn sàng. Bắt đầu vòng lặp chính...")
 try:
     while True:
@@ -271,196 +616,15 @@ try:
         rfid_id, rfid_text = reader.read()
 
         print(f"💳 [Main] Phát hiện thẻ! ID: {rfid_id}. Dựng cờ VEHICLE_EVENT...")
-        VEHICLE_EVENT.set()
+        VEHICLE_EVENT.set() # Dựng cờ để tạm dừng các luồng đồng bộ
 
-        print("📸 [Main] Bắt đầu chụp ảnh và nhận dạng biển số...")
+        # Gọi hàm xử lý chính, đã được tái cấu trúc
+        _process_vehicle_event(rfid_id, cap)
 
-        for _ in range(5): cap.read()
-        ret, live_frame = cap.read()
-
-        if not ret or live_frame is None:
-            print("❌ [Main] Không thể lấy khung hình từ camera.")
-            log_error("Không thể lấy khung hình từ camera trong vòng lặp chính.", category="CAMERA")
-            VEHICLE_EVENT.clear()
-            continue
-
-        # Biến để lưu ảnh crop, sẽ được dùng ở cả IN và OUT
-        cropped_license_plate_img = None
-        normalized_plate = ""
-        original_frame_to_save = None # Sẽ được gán sau khi chụp ảnh thành công
-
-        with DB_ACCESS_LOCK: # Khóa truy cập CSDL cho toàn bộ quá trình xử lý thẻ RFID
-            try:
-                print(f"   [Main] Đã giành được khóa CSDL. Bắt đầu xử lý cho thẻ ID: {rfid_id}")
-                # 1. KIỂM TRA THẺ RFID TRONG CSDL
-                with sqlite3.connect(DB_FILE, timeout=10.0) as conn_check_rfid:
-                    conn_check_rfid.row_factory = sqlite3.Row
-                    cursor_check_rfid = conn_check_rfid.cursor()
-                    cursor_check_rfid.execute("SELECT * FROM parking_log WHERE rfid_token = ? AND status = ?", (str(rfid_id), STATUS_INSIDE))
-                    vehicle_inside_record = cursor_check_rfid.fetchone()
-
-                # 2. CHỤP ẢNH VÀ NHẬN DẠNG BIỂN SỐ
-                print("📸 [AI] Đang chụp và xử lý ảnh...")
-                for _ in range(3): cap.read()
-                ret, live_frame = cap.read()
-                if not ret:
-                    print("❌ [AI] Không thể chụp khung hình từ camera.")
-                    log_error("Không thể chụp khung hình từ camera cho AI.", category="CAMERA/AI")
-                    VEHICLE_EVENT.clear()
-                    continue # Bỏ qua và chờ lượt quét thẻ tiếp theo
-
-                original_frame_to_save = live_frame.copy()
-                # Phát hiện vùng biển số
-                plate_detection_results = yolo_LP_detect(live_frame.copy(), size=640)
-                detected_coords_list = plate_detection_results.pandas().xyxy[0].values.tolist()
-
-                if detected_coords_list:
-                    detected_coords_list.sort(key=lambda x: (x[2]-x[0])*(x[3]-x[1]), reverse=True)
-                    x1, y1, x2, y2 = map(int, detected_coords_list[0][:4])
-                    y1, y2 = max(0, y1), min(original_frame_to_save.shape[0], y2)
-                    x1, x2 = max(0, x1), min(original_frame_to_save.shape[1], x2)
-                    if y2 > y1 and x2 > x1:
-                        cropped_license_plate_img = original_frame_to_save[y1:y2, x1:x2]
-                        found_license_plate_text = helper.read_plate(yolo_license_plate, cropped_license_plate_img.copy())
-                    else:
-                        found_license_plate_text = helper.read_plate(yolo_license_plate, live_frame.copy())
-                else:
-                    found_license_plate_text = helper.read_plate(yolo_license_plate, live_frame.copy())
-                
-                normalized_plate = normalize_plate(found_license_plate_text)
-
-                if not normalized_plate or normalized_plate == "UNKNOWN":
-                    print("❌ [AI] Không nhận dạng được biển số hợp lệ.")
-                    log_error(f"Không nhận dạng được biển số hợp lệ. RFID: {rfid_id}, Raw Plate: {found_license_plate_text}", category="AI/VALIDATION") 
-                    # Pass a dictionary for image_paths_event
-                    image_paths_failure_no_plate = {"raw": "", "crop": ""}
-                    log_access("FAIL_IN" if vehicle_inside_record is None else "FAIL_OUT", found_license_plate_text, rfid_id, "NO_PLATE_DETECTED", image_paths_failure_no_plate, get_vietnam_time_str()) 
-                    VEHICLE_EVENT.clear()
-                    continue
-                print(f"🎉 [AI] Phát hiện biển số: '{found_license_plate_text}' -> Chuẩn hóa: '{normalized_plate}'")
-
-                # --- 3. LOGIC XỬ LÝ VÀO/RA ---
-                # --- NHÁNH 1.1: XE ĐANG VÀO (Thẻ RFID này chưa được ghi nhận là ở trong bãi) ---
-                if vehicle_inside_record is None:
-                    print("➡️  [Logic] Xử lý luồng VÀO...")
-                    is_plate_already_inside = False
-                    # Thực hiện kiểm tra biển số trong CSDL để xem có biển số này đã được ghi nhận là ở trong bãi với một thẻ khác hay không
-                    with sqlite3.connect(DB_FILE, timeout=10.0) as conn_check_plate:
-                        cursor_check_plate = conn_check_plate.cursor()
-                        cursor_check_plate.execute("SELECT id FROM parking_log WHERE plate = ? AND status = ?", (normalized_plate, STATUS_INSIDE))
-                        if cursor_check_plate.fetchone():
-                            is_plate_already_inside = True
-                    
-                    if is_plate_already_inside:
-                        print(f"🚨 [Logic] Xác thực THẤT BẠI: Biển số '{normalized_plate}' đã được ghi nhận ở trong bãi với một thẻ khác. Từ chối cho vào.")
-                        log_error(f"Xác thực THẤT BẠI VÀO: Biển số '{normalized_plate}' (RFID: {rfid_id}) đã ở trong bãi với thẻ khác.", category="LOGIC/VALIDATION") 
-                        # Define image_paths_event dictionary
-                        image_paths_failure_already_inside = {
-                            "raw": raw_image_filename if 'raw_image_filename' in locals() else "",
-                            "crop": crop_image_filename if 'crop_image_filename' in locals() and cropped_license_plate_img is not None and cropped_license_plate_img.size > 0 else ""
-                        }
-                        log_access("FAIL_IN", normalized_plate, rfid_id, "ALREADY_INSIDE_DIFF_RFID", image_paths_failure_already_inside, get_vietnam_time_str(), details="Plate already inside with different RFID") 
-                        # Không cần `continue` ở đây vì đã có DB_ACCESS_LOCK, luồng sẽ đi xuống cuối và clear event
-                    else:
-                        print(f"✅ [Logic] Xác thực THÀNH CÔNG: Biển số '{normalized_plate}' hợp lệ để vào.")
-                        current_time_str = get_vietnam_time_str()
-                        timestamp_fn = get_vietnam_time_for_filename()
-                        base_fn = f"in_{timestamp_fn}_{sanitize_filename_component(normalized_plate)}"
-                        raw_image_filename = f"raw_{base_fn}.jpg"
-                        crop_image_filename = f"crop_{base_fn}.jpg"
-                        raw_path_viewer = os.path.join(PICTURE_OUTPUT_DIR, raw_image_filename)
-                        
-                        try:
-                            cv2.imwrite(raw_path_viewer, original_frame_to_save)
-                            print(f"🖼️  [FS] Đã lưu ảnh VÀO (gốc) cho viewer: {raw_path_viewer}")
-                            if cropped_license_plate_img is not None and cropped_license_plate_img.size > 0:
-                                crop_path_viewer = os.path.join(PICTURE_OUTPUT_DIR, crop_image_filename)
-                                cv2.imwrite(crop_path_viewer, cropped_license_plate_img)
-                                print(f"🖼️  [FS] Đã lưu ảnh VÀO (biển số) cho viewer: {crop_path_viewer}")
-                        except Exception as e_img:
-                            print(f"❌ [FS] Lỗi khi lưu ảnh VÀO cho viewer: {e_img}")
-                            log_error(f"Lỗi khi lưu ảnh VÀO cho viewer (Plate: {normalized_plate})", category="FILESYSTEM", exception_obj=e_img) 
-                            # raw_image_filename sẽ chỉ là tên file, không phải đường dẫn đầy đủ
-                        
-                        # Thực hiện INSERT trong CSDL
-                        with sqlite3.connect(DB_FILE, timeout=10.0) as conn_insert:
-                            cursor_insert = conn_insert.cursor()
-                            cursor_insert.execute("INSERT INTO parking_log (plate, rfid_token, time_in, image_path_in, status, synced_to_server) VALUES (?, ?, ?, ?, ?, ?)",
-                                                 (normalized_plate, str(rfid_id), current_time_str, raw_image_filename, STATUS_INSIDE, 0))
-                            last_id = cursor_insert.lastrowid
-                            conn_insert.commit() # Cam kết INSERT thành công
-                            print(f"💾 [DB] Sự kiện VÀO đã được lưu cục bộ. ID: {last_id}")
-                            # Define image_paths_event dictionary
-                            image_paths_in_success = {
-                                "raw": raw_image_filename,
-                                "crop": crop_image_filename if cropped_license_plate_img is not None and cropped_license_plate_img.size > 0 else ""
-                            }
-                            log_access("IN", normalized_plate, rfid_id, "SUCCESS", image_paths_in_success, current_time_str, details=f"DB_ID: {last_id}") 
-                            SYNC_WORK_AVAILABLE.set()
-
-
-                # --- NHÁNH 1.2: XE ĐANG RA (Thẻ RFID này đã được ghi nhận là ở trong bãi) ---
-                else:
-                    print("⬅️  [Logic] Xử lý luồng RA...")
-                    plate_in_db = vehicle_inside_record['plate']
-
-                    if normalized_plate != plate_in_db:
-                        print(f"🚨 [Logic] Cảnh báo An ninh: Biển số ra '{normalized_plate}' KHÔNG KHỚP biển số vào '{plate_in_db}'. Từ chối cho ra.")
-                        log_error(f"Cảnh báo An ninh RA: Biển số ra '{normalized_plate}' (RFID: {rfid_id}) KHÔNG KHỚP biển vào '{plate_in_db}'.", category="LOGIC/SECURITY") 
-                        # Define image_paths_event dictionary
-                        image_paths_failure_mismatch = {
-                            "raw": raw_image_filename_out if 'raw_image_filename_out' in locals() else "",
-                            "crop": crop_image_filename_out if 'crop_image_filename_out' in locals() and cropped_license_plate_img is not None and cropped_license_plate_img.size > 0 else ""
-                        }
-                        log_access("FAIL_OUT", normalized_plate, rfid_id, "PLATE_MISMATCH", image_paths_failure_mismatch, get_vietnam_time_str(), details=f"Expected plate: {plate_in_db}") 
-                    else:
-                        print("✅ [Logic] Xác thực biển số thành công.")
-                        current_time_str = get_vietnam_time_str()
-                        timestamp_fn = get_vietnam_time_for_filename()
-                        record_id_to_update = vehicle_inside_record['id']
-                        base_fn = f"out_{timestamp_fn}_{sanitize_filename_component(normalized_plate)}"
-                        raw_image_filename_out = f"raw_{base_fn}.jpg"
-                        crop_image_filename_out = f"crop_{base_fn}.jpg"
-                        raw_path_viewer_out = os.path.join(PICTURE_OUTPUT_DIR, raw_image_filename_out)
-
-                        try:
-                            cv2.imwrite(raw_path_viewer_out, original_frame_to_save)
-                            print(f"🖼️  [FS] Đã lưu ảnh RA (gốc) cho viewer: {raw_path_viewer_out}")
-                            if cropped_license_plate_img is not None and cropped_license_plate_img.size > 0:
-                                crop_path_viewer_out = os.path.join(PICTURE_OUTPUT_DIR, crop_image_filename_out)
-                                cv2.imwrite(crop_path_viewer_out, cropped_license_plate_img)
-                                print(f"🖼️  [FS] Đã lưu ảnh RA (biển số) cho viewer: {crop_path_viewer_out}")
-                        except Exception as e_img:
-                            print(f"❌ [FS] Lỗi khi lưu ảnh RA cho viewer: {e_img}")
-                            log_error(f"Lỗi khi lưu ảnh RA cho viewer (Plate: {normalized_plate})", category="FILESYSTEM", exception_obj=e_img) 
-
-                        with sqlite3.connect(DB_FILE, timeout=10.0) as conn_update:
-                            cursor_update = conn_update.cursor()
-                            cursor_update.execute("UPDATE parking_log SET time_out = ?, image_path_out = ?, status = ?, synced_to_server = ? WHERE id = ?",
-                                                 (current_time_str, raw_image_filename_out, STATUS_COMPLETED, 0, record_id_to_update))
-                            conn_update.commit() # Cam kết UPDATE thành công
-                            print(f"💾 [DB] Sự kiện RA đã được cập nhật cục bộ cho ID: {record_id_to_update}")
-                            # Define image_paths_event dictionary
-                            image_paths_out_success = {
-                                "raw": raw_image_filename_out,
-                                "crop": crop_image_filename_out if cropped_license_plate_img is not None and cropped_license_plate_img.size > 0 else ""
-                            }
-                            log_access("OUT", normalized_plate, rfid_id, "SUCCESS", image_paths_out_success, current_time_str, details=f"DB_ID: {record_id_to_update}") 
-                            SYNC_WORK_AVAILABLE.set()
-            
-            except Exception as e_txn:
-                print(f"🔥 [Main] Lỗi trong quá trình xử lý (bên trong DB_ACCESS_LOCK): {e_txn}")
-                log_error(f"Lỗi trong quá trình xử lý cho RFID {rfid_id}, Plate {normalized_plate}", category="TRANSACTION", exception_obj=e_txn)
-            
-            finally: # Đảm bảo DB_ACCESS_LOCK luôn được giải phóng
-                print("   [Main] Xử lý cục bộ hoàn tất (hoặc đã hủy). Nhả khóa DB_ACCESS_LOCK.")
-                # Không cần giải phóng lock ở đây vì `with DB_ACCESS_LOCK:` đã tự làm
-
-        # 3. Hạ cờ VEHICLE_EVENT sau khi đã nhả DB_ACCESS_LOCK
-        print("   [Main] Hạ cờ VEHICLE_EVENT, cho phép đồng bộ hoạt động.")
-        VEHICLE_EVENT.clear()
+        print("   [Main] Hạ cờ VEHICLE_EVENT, cho phép đồng bộ hoạt động trở lại.")
+        VEHICLE_EVENT.clear() # Hạ cờ để các luồng khác tiếp tục
         
-        time.sleep(1) # Giảm thời gian chờ giữa các lần quét thẻ chính
+        time.sleep(1) # Nghỉ một chút trước khi chờ lần quẹt thẻ tiếp theo
 
 except KeyboardInterrupt:
     print("\n🛑 [Main] Phát hiện ngắt từ bàn phím. Đang tắt chương trình...")
@@ -470,11 +634,16 @@ except Exception as e_main_loop:
     log_error("Một lỗi nghiêm trọng, chưa được xử lý đã xảy ra trong vòng lặp chính.", category="FATAL", exception_obj=e_main_loop) 
 finally:
     print("🧹 [Main] Dọn dẹp tài nguyên...")
+    LIVE_VIEW_THREAD_RUNNING.clear() # Tắt luồng xem trực tiếp
+    if 'live_view_thread' in locals() and live_view_thread.is_alive():
+        live_view_thread.join(timeout=1)
     if 'cap' in locals() and cap.isOpened():
         cap.release()
         print("   [Main] Camera đã được giải phóng.")
-    if 'GPIO' in locals() and 'cleanup' in dir(GPIO):
-        try: GPIO.cleanup()
-        except: pass
-        print("   [Main] GPIO đã được dọn dẹp (nếu được sử dụng).")
+    if 'GPIO' in locals():
+        try: 
+            GPIO.cleanup()
+            print("   [Main] GPIO đã được dọn dẹp.")
+        except Exception as e_gpio:
+            print(f"   [Main] Lỗi khi dọn dẹp GPIO: {e_gpio}")
     print("👋 [Main] Chương trình đã kết thúc.")
