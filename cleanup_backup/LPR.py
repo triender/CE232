@@ -10,19 +10,24 @@ from dotenv import load_dotenv
 import json
 import traceback
 from filelock import FileLock
+from constants import *
+from project_utils import get_vietnam_time_str, get_vietnam_time_for_filename, normalize_plate, sanitize_filename_component, ensure_directories_exist
 
-# Import từ module gộp mới
-from core_utils import (
-    STATUS_INSIDE, STATUS_COMPLETED, STATUS_INVALID,
-    get_vietnam_time_str, SafeDatabaseManager, SafeErrorLogger,
-    NetworkManager, SafeCameraManager, HardwareMock, ThreadSafeManager,
-    Config
-)
+# Import new modules for better error handling and thread safety
+from hardware_mock import get_hardware_modules
+from thread_safe_utils import ThreadSafeManager, SafeErrorLogger, safe_normalize_plate
+from database_manager import SafeDatabaseManager
+from network_manager import NetworkManager, SyncResult, create_event_payload
+from camera_manager import SafeCameraManager
 
-# --- CẤU HÌNH ---
+# Get appropriate hardware modules (real or mock)
+GPIO, SimpleMFRC522 = get_hardware_modules()
+
+# --- CẤU HÌNH VÀ HẰNG SỐ ---
 load_dotenv()
 API_ENDPOINT = os.getenv("API_ENDPOINT", "http://localhost:3000/api/events/submit")
 UID = os.getenv("UID")
+DB_FILE = os.getenv("DB_FILE", "parking_data.db")
 IMAGE_DIR = os.getenv("IMAGE_DIR", "offline_images")
 PICTURE_OUTPUT_DIR = os.getenv("PICTURE_OUTPUT_DIR", "picture")
 YOLOV5_REPO_PATH = os.getenv("YOLOV5_REPO_PATH")

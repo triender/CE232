@@ -53,8 +53,7 @@ packaging==25.0
 
 # Hardware interface (Raspberry Pi)
 RPi.GPIO==0.7.1
-mfrc522==0.0.7
-spidev==3.7
+setuptools<81.0.0
 
 # System utilities
 psutil==7.0.0
@@ -70,3 +69,6 @@ networkx==3.4.2
 sympy==1.14.0
 typing_extensions==4.13.2
 six==1.17.0
+
+# WSGI HTTP Server
+gunicorn

@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+
+{% block title %}Lịch Sử Ra Vào Bãi Xe{% endblock %}
+
+{% block head_extra %}
+{# Đã loại bỏ script tự động tải lại trang vì không còn cần thiết #}
+{% endblock %}
+
+{% block content %}
+<h1 class="text-center">Lịch Sử Ra Vào Bãi Xe</h1>
+
+{# --- Thanh Tìm Kiếm --- #}
+<div class="search-container">
+    <form method="GET" action="{{ url_for('index') }}">
+        <input type="text" name="search" placeholder="Tìm biển số..." value="{{ search_query or '' }}">
+        <button type="submit">Tìm kiếm</button>
+    </form>
+</div>
+
+{# Chỉ hiển thị bảng nếu không có lỗi và có sự kiện #}
+{% if not error_message %}
+<table>
+  <thead>
+    <tr>
+      <th>STT</th>
+      <th>Trạng Thái</th>
+      <th>Thời Gian</th>
+      <th>Biển Số</th>
+      <th>Ảnh Gốc</th>
+      {# Bỏ cột ảnh crop vì không có dữ liệu #}
+    </tr>
+  </thead>
+  <tbody>
+    {% for event in events %}
+    <tr>
+      <td>{{ ((page - 1) * per_page) + loop.index }}</td> {# Khôi phục STT cho đúng với phân trang #}
+      <td>
+        {% if event.type == 'INVALID' %}
+          <span class="status-fail">KHÔNG HỢP LỆ</span>
+        {% elif event.type == 'IN' %}
+          <span class="status-in">VÀO</span>
+        {% elif event.type == 'OUT' %}
+          <span class="status-out">RA</span>
+        {% else %}
+          <span>{{ event.type }}</span>
+        {% endif %}
+      </td>
+      <td>{{ event.time_str }}</td>
+      <td><b>{{ event.plate }}</b></td>
+      <td>
+          {% if event.raw %}
+              <a href="{{ url_for('get_image', filename=event.raw) }}" target="_blank">
+                  <img src="{{ url_for('get_image', filename=event.raw) }}" alt="Ảnh sự kiện">
+              </a>
+          {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr>
+        <td colspan="5">Không tìm thấy lịch sử nào.</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{# --- PHÂN TRANG --- #}
+<div class="pagination">
+    {# Nút về trang đầu #}
+    {% if page > 1 %}
+        <a href="{{ url_for('index', page=1, search=search_query) }}">&laquo; Đầu</a>
+    {% endif %}
+
+    {# Nút lùi 1 trang #}
+    {% if page > 1 %}
+        <a href="{{ url_for('index', page=page-1, search=search_query) }}">&lsaquo; Trước</a>
+    {% endif %}
+
+    {# Hiển thị các trang xung quanh trang hiện tại #}
+    {% for p in range(1, total_pages + 1) %}
+        {% if p >= page - 2 and p <= page + 2 %}
+            {% if p == page %}
+                <a href="#" class="active">{{ p }}</a>
+            {% else %}
+                <a href="{{ url_for('index', page=p, search=search_query) }}">{{ p }}</a>
+            {% endif %}
+        {% endif %}
+    {% endfor %}
+
+    {# Nút tiến 1 trang #}
+    {% if page < total_pages %}
+        <a href="{{ url_for('index', page=page+1, search=search_query) }}">Sau &rsaquo;</a>
+    {% endif %}
+
+    {# Nút đến trang cuối #}
+    {% if page < total_pages %}
+        <a href="{{ url_for('index', page=total_pages, search=search_query) }}">Cuối &raquo;</a>
+    {% endif %}
+</div>
+{% endif %}
+{# --- KẾT THÚC PHÂN TRANG --- #}
+{% endblock %}

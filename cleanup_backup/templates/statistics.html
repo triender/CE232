@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}Giám sát bãi đỗ xe - Thống Kê{% endblock %}
+
+{% block content %}
+<h1>Thống Kê Hoạt Động</h1>
+
+<div class="filter-bar">
+    <a href="{{ url_for('statistics', period='daily') }}" class="{% if period == 'daily' %}active{% endif %}">Hôm nay</a>
+    <a href="{{ url_for('statistics', period='weekly') }}" class="{% if period == 'weekly' %}active{% endif %}">Tuần này</a>
+    <a href="{{ url_for('statistics', period='monthly') }}" class="{% if period == 'monthly' %}active{% endif %}">Tháng này</a>
+</div>
+
+<h2>Tổng quan {{ period_title }}</h2>
+
+{# Chỉ hiển thị box nếu không có lỗi #}
+{% if not error_message %}
+<div class="stats-box">
+    <div class="stats-item">
+        <h3>Tổng lượt vào</h3>
+        <p>{{ stats.total_in }}</p>
+    </div>
+    <div class="stats-item">
+        <h3>Tổng lượt ra</h3>
+        <p>{{ stats.total_out }}</p>
+    </div>
+    {# Đã loại bỏ mục Thất bại vì không còn dữ liệu #}
+</div>
+{% endif %}
+
+{% endblock %}

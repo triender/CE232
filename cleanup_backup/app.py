@@ -1,27 +1,28 @@
-from flask import Flask, render_template, send_from_directory, request, redirect, url_for
+import threading
+from flask import Flask, render_template, send_from_directory, jsonify, request, redirect, url_for
 import os
 from datetime import datetime, date, timedelta
 import sqlite3
 from filelock import FileLock, Timeout
+from constants import STATUS_INSIDE, STATUS_COMPLETED, STATUS_INVALID
+from project_utils import get_vietnam_time_str
+from database_manager import SafeDatabaseManager
+from thread_safe_utils import SafeErrorLogger
 
-# Import từ module gộp mới
-from core_utils import (
-    STATUS_INSIDE, STATUS_COMPLETED, STATUS_INVALID,
-    get_vietnam_time_str, SafeDatabaseManager, SafeErrorLogger, Config
-)
+# Configuration
+PICTURE_FOLDER = os.getenv("PICTURE_OUTPUT_DIR", "picture")
+TMP_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+DB_FILE = os.getenv("DB_FILE", "parking_data.db")
+DB_LOCK_FILE = DB_FILE + ".lock"
 
 # Initialize services
-db_manager = SafeDatabaseManager(Config.DB_FILE)
+db_manager = SafeDatabaseManager(DB_FILE)
 error_logger = SafeErrorLogger("app_error.log")
 app = Flask(__name__)
 
-# Ensure directories exist
-os.makedirs(Config.PICTURE_OUTPUT_DIR, exist_ok=True)
-os.makedirs(Config.TMP_DIR, exist_ok=True)
-
 def get_db_connection():
     """Get database connection with row factory."""
-    conn = sqlite3.connect(Config.DB_FILE, timeout=5.0)
+    conn = sqlite3.connect(DB_FILE, timeout=5.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -57,7 +58,7 @@ def index():
     error_message = None
 
     try:
-        with FileLock(Config.DB_FILE + ".lock", timeout=5.0):
+        with FileLock(DB_LOCK_FILE, timeout=5.0):
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 
@@ -163,7 +164,7 @@ def cameras():
 @app.route('/video_feed')
 def video_feed():
     """Endpoint để cung cấp hình ảnh camera trực tiếp."""
-    response = send_from_directory(Config.TMP_DIR, 'live_view.jpg')
+    response = send_from_directory(TMP_FOLDER, 'live_view.jpg')
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
@@ -194,7 +195,7 @@ def statistics():
     error_message = None
 
     try:
-        with FileLock(Config.DB_FILE + ".lock", timeout=5.0):
+        with FileLock(DB_LOCK_FILE, timeout=5.0):
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 
@@ -225,10 +226,14 @@ def statistics():
 
 @app.route('/image/<filename>')
 def get_image(filename):
-    return send_from_directory(Config.PICTURE_OUTPUT_DIR, filename)
+    return send_from_directory(PICTURE_FOLDER, filename)
 
 if __name__ == '__main__':
-    print("✅ Flask Web Interface - Parking Management System")
-    print(f"🌐 Listening on {Config.FLASK_HOST}:{Config.FLASK_PORT}")
+    if not os.path.exists(PICTURE_FOLDER):
+        os.makedirs(PICTURE_FOLDER)
+    if not os.path.exists(TMP_FOLDER):
+        os.makedirs(TMP_FOLDER)
+
+    print("✅ CSDL là nguồn dữ liệu duy nhất. Bỏ qua việc tải file log.")
     
-    app.run(host=Config.FLASK_HOST, port=Config.FLASK_PORT, debug=Config.FLASK_DEBUG)
+    app.run(host='0.0.0.0', port=5000, debug=False)
