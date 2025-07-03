@@ -12,10 +12,12 @@ from dotenv import load_dotenv
 import json
 import traceback
 from filelock import FileLock
+from constants import *
+from utils import get_vietnam_time_str, get_vietnam_time_for_filename, normalize_plate, sanitize_filename_component, ensure_directories_exist
 
 # --- CẤU HÌNH VÀ HẰNG SỐ ---
 load_dotenv()
-API_ENDPOINT = os.getenv("API_ENDPOINT", "http://localhost:3000/api/events/submit") # SỬA LỖI: Cập nhật endpoint chính xác
+API_ENDPOINT = os.getenv("API_ENDPOINT", "http://localhost:3000/api/events/submit")
 UID = os.getenv("UID")
 DB_FILE = os.getenv("DB_FILE", "parking_data.db")
 IMAGE_DIR = os.getenv("IMAGE_DIR", "offline_images")
@@ -25,17 +27,7 @@ LP_DETECTOR_MODEL_PATH = os.getenv("LP_DETECTOR_MODEL_PATH")
 LP_OCR_MODEL_PATH = os.getenv("LP_OCR_MODEL_PATH")
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 
-ACCESS_LOG_FILE = "access_log.jsonl"
-ERROR_LOG_FILE = "error_log.txt"
-LOG_SYNC_STATE_FILE = "log_sync.state"
-
-STATUS_INSIDE = 1
-STATUS_COMPLETED = 2
-STATUS_INVALID = 99
-# STATUS_MAP_TO_SERVER_API is no longer needed with the new event-based API
-# STATUS_MAP_TO_SERVER_API = { STATUS_INSIDE: 0, STATUS_COMPLETED: 1 }
-# STATUS_MAP_TO_STRING = { STATUS_INSIDE: 'INSIDE', 'COMPLETED': 'COMPLETED', 'INVALID': 'INVALID' } # Không còn sử dụng
-
+# --- Threading locks and events ---
 DB_LOCK_FILE = DB_FILE + ".lock"
 DB_ACCESS_LOCK = FileLock(DB_LOCK_FILE, timeout=15)
 CAMERA_LOCK = threading.Lock()
@@ -45,10 +37,11 @@ FAILURE_LOG_SYNC_AVAILABLE = threading.Event()
 LIVE_VIEW_THREAD_RUNNING = threading.Event()
 
 # --- Cài đặt GPIO ---
-GREEN_LED_PIN = 16
 
 # --- LOGGING FUNCTIONS ---
-def log_access(event_type, plate, rfid, status_event, image_paths_event: dict, timestamp_event, details="", db_id=None):
+def log_access(event_type: str, plate: str, rfid: str, status_event: str, 
+               image_paths_event: dict, timestamp_event: str, details: str = "", db_id: int = None) -> None:
+    """Log access events to JSONL file."""
     log_entry = {
         "timestamp": timestamp_event,
         "event_type": event_type,
@@ -70,7 +63,8 @@ def log_access(event_type, plate, rfid, status_event, image_paths_event: dict, t
     except Exception as e:
         print(f"🔥 [LogAccess] Failed to write to access log: {e}")
 
-def log_error(message, category="GENERAL", exception_obj=None):
+def log_error(message: str, category: str = "GENERAL", exception_obj: Exception = None) -> None:
+    """Log error messages to error log file."""
     try:
         with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{get_vietnam_time_str()}] [{category}] {message}\n")
@@ -81,7 +75,7 @@ def log_error(message, category="GENERAL", exception_obj=None):
         print(f"🔥 [LogError] Failed to write to error log: {e}")
 
 
-def _blink_led_target():
+def _blink_led_target() -> None:
     """Hàm mục tiêu cho luồng LED. Bật LED, đợi, sau đó tắt."""
     try:
         GPIO.output(GREEN_LED_PIN, GPIO.HIGH)
@@ -91,14 +85,14 @@ def _blink_led_target():
         GPIO.output(GREEN_LED_PIN, GPIO.LOW)
         print("🟢 [LED] Đèn xanh TẮT")
 
-def blink_success_led():
+def blink_success_led() -> None:
     """Bắt đầu một luồng mới để chớp đèn LED xanh trong 2 giây."""
     led_thread = threading.Thread(target=_blink_led_target)
     led_thread.daemon = True
     led_thread.start()
 
 
-def live_view_capture_thread(cap):
+def live_view_capture_thread(cap) -> None:
     """
     A thread that continuously captures frames from the camera and saves it
     to a temporary file for the web view.
@@ -133,10 +127,9 @@ def live_view_capture_thread(cap):
         time.sleep(0.5)
 
 
-if not all([API_ENDPOINT, DB_FILE, IMAGE_DIR, PICTURE_OUTPUT_DIR, YOLOV5_REPO_PATH, LP_DETECTOR_MODEL_PATH, LP_OCR_MODEL_PATH]):
-    print("❌ Lỗi: Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.")
-    log_error("Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.", category="ENVIRONMENT")
-    exit()
+# --- VALIDATION ---
+if not validate_environment_variables():
+    exit(1)
 
 try:
     import function.utils_rotate as utils_rotate
@@ -151,39 +144,41 @@ except ImportError:
             cls._plate_counter +=1
             if time.time() % 10 > 2:
                  return f"MOCK{int(time.time())%1000 + cls._plate_counter:04d}LP"
-            return "unknown"
-    helper = MockHelper()
+            return "unknown"            helper = MockHelper()
 
-def get_vietnam_time_object():
-    return datetime.now(timezone(timedelta(hours=7)))
-def get_vietnam_time_str():
-    return get_vietnam_time_object().strftime("%Y-%m-%d %H:%M:%S")
-def get_vietnam_time_for_filename():
-    return get_vietnam_time_object().strftime("%d_%m_%Y_%Hh%Mm%S")
-def normalize_plate(plate_text: str) -> str:
-    if not plate_text: return ""
-    return "".join(filter(str.isalnum, plate_text)).upper()
-def sanitize_filename_component(name_part: str) -> str:
-    return "".join(c if c.isalnum() else "_" for c in str(name_part)).rstrip("_")
+def validate_environment_variables() -> bool:
+    """Kiểm tra các biến môi trường cần thiết."""
+    required_vars = [API_ENDPOINT, DB_FILE, IMAGE_DIR, PICTURE_OUTPUT_DIR, 
+                     YOLOV5_REPO_PATH, LP_DETECTOR_MODEL_PATH, LP_OCR_MODEL_PATH]
+    if not all(required_vars):
+        print("❌ Lỗi: Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.")
+        log_error("Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.", category="ENVIRONMENT")
+        return False
+    return True
 
-def init_db():
+def init_db() -> None:
+    """Khởi tạo cơ sở dữ liệu SQLite."""
     with DB_ACCESS_LOCK:
         with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
             cursor = conn.cursor()
-            # CẢI TIẾN: Cho phép image_path_in và image_path_out có thể NULL
+            # Cho phép image_path_in và image_path_out có thể NULL
             # để xử lý các trường hợp không có ảnh (ví dụ: force_out từ web hoặc lỗi chụp ảnh)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS parking_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, plate TEXT NOT NULL, rfid_token TEXT NOT NULL,
-                    time_in TEXT NOT NULL, time_out TEXT, image_path_in TEXT, image_path_out TEXT,
-                    status INTEGER NOT NULL, synced_to_server INTEGER NOT NULL DEFAULT 0
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                    plate TEXT NOT NULL, 
+                    rfid_token TEXT NOT NULL,
+                    time_in TEXT NOT NULL, 
+                    time_out TEXT, 
+                    image_path_in TEXT, 
+                    image_path_out TEXT,
+                    status INTEGER NOT NULL, 
+                    synced_to_server INTEGER NOT NULL DEFAULT 0
                 )
             ''')
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_status ON parking_log (rfid_token, status)")
     print("✅ [DB] CSDL đã được khởi tạo.")
-    os.makedirs(IMAGE_DIR, exist_ok=True)
-    os.makedirs(PICTURE_OUTPUT_DIR, exist_ok=True)
-    os.makedirs(TMP_DIR, exist_ok=True)
+    ensure_directories_exist(IMAGE_DIR, PICTURE_OUTPUT_DIR, TMP_DIR)
 
 
 def send_event_to_server(event_payload: dict, image_data_bytes: bytes = None) -> str:

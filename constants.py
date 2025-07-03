@@ -1,0 +1,29 @@
+"""
+Constants used across the parking management system.
+"""
+
+# Database status constants
+STATUS_INSIDE = 1
+STATUS_COMPLETED = 2
+STATUS_INVALID = 99
+
+# File paths
+ACCESS_LOG_FILE = "access_log.jsonl"
+ERROR_LOG_FILE = "error_log.txt"
+LOG_SYNC_STATE_FILE = "log_sync.state"
+
+# GPIO pins
+GREEN_LED_PIN = 16
+
+# Event types
+EVENT_TYPE_IN = "IN"
+EVENT_TYPE_OUT = "OUT"
+EVENT_TYPE_FAIL_IN = "FAIL_IN"
+EVENT_TYPE_FAIL_OUT = "FAIL_OUT"
+EVENT_TYPE_MANUAL_OUT = "MANUAL_OUT"
+
+# Status events
+STATUS_SUCCESS = "SUCCESS"
+STATUS_NO_PLATE_DETECTED = "NO_PLATE_DETECTED"
+STATUS_PLATE_MISMATCH = "PLATE_MISMATCH"
+STATUS_ALREADY_INSIDE_DIFF_RFID = "ALREADY_INSIDE_DIFF_RFID"

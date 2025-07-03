@@ -1,55 +1,199 @@
-# Ignore everything by default
-*
-
-# --- EXCEPTIONS ---
-# Do NOT ignore LPR.py
-!LPR.py
-
-# Do NOT ignore the .gitignore file itself
-!.gitignore
-
-# Do NOT ignore README.md 
-!README.md file
-
-# Do NOT ignore requirements.txt
-!requirements.txt
-
-# Python
+# Python bytecode and cache
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*build/
-*dist/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
 ai_env/
 venv/
 .venv/
+env/
+ENV/
+env.bak/
+venv.bak/
 
-# Logs & Data
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Parking System Logs & Runtime Data
 *.log
-*.jsonl
 error_log.txt
 access_log.jsonl
 parking_data.db
 parking_data.db.lock
 log_sync.state
 
-# Generated files
+# Generated runtime files
 tmp/
 picture/
 offline_images/
 
-# AI Models - These are typically large and should not be in git
+# Backup files
+*.bak
+*.backup
+*~
+
+# System generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# AI Models - Large files, should be downloaded separately
 model/*.pt
+model/*.pth
+model/*.onnx
+model/*.tflite
+*.weights
 
-# External libraries
+# AI Model cache
+.torch/
+.cache/torch/
+.triton/
+
+# External libraries and dependencies
 yolov5/
+node_modules/
 
-# Environment variables
+# Environment variables and secrets
 .env
 .env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+config.ini
+secrets.json
 
-# IDE / Editor specific
+# SSH keys and certificates
+*.pem
+*.key
+*.crt
+*.p12
+
+# IDE and Editor files
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Project specific - Old/unused files
+*.lp_image.py
+LPR_old.py
+rfid.py
+lp_image.py
+
+# Hardware specific files (Raspberry Pi)
+/boot/
+/proc/
+/sys/
+/dev/
+
+# Documentation build
+docs/_build/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+temporary/
+
+# Database files (keep structure, ignore data)
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# Media files (should be managed separately)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg.bak
+*.png.bak

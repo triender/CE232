@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}Giám sát bãi đỗ xe - Xe Trong Bãi{% endblock %}
+
+{% block content %}
+<h1 class="text-center">Xe Hiện Có Trong Bãi ({{ count }})</h1>
+
+{# --- Thanh Tìm Kiếm --- #}
+<div class="search-container">
+    <form method="GET" action="{{ url_for('vehicles_in_lot') }}">
+        <input type="text" name="search" placeholder="Tìm biển số..." value="{{ search_query or '' }}">
+        <button type="submit">Tìm kiếm</button>
+    </form>
+</div>
+
+{# Chỉ hiển thị bảng nếu không có lỗi #}
+{% if not error_message %}
+<table>
+  <thead>
+    <tr>
+      <th>STT</th>
+      <th>Thời Gian Vào</th>
+      <th>Biển Số</th>
+      <th>Ảnh Vào</th>
+      <th>Hành Động</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for vehicle in vehicles %}
+    <tr>
+      <td>{{ loop.index }}</td>
+      <td>{{ vehicle.time_str }}</td>
+      <td><b>{{ vehicle.plate }}</b></td>
+      <td>
+          {% if vehicle.raw %}
+              <a href="{{ url_for('get_image', filename=vehicle.raw) }}" target="_blank">
+                  <img src="{{ url_for('get_image', filename=vehicle.raw) }}" alt="Ảnh vào">
+              </a>
+          {% endif %}
+      </td>
+      <td>
+        {% if vehicle.db_id %}
+          <form action="{{ url_for('force_out') }}" method="POST" onsubmit="return confirm('Bạn có chắc muốn ghi nhận xe này đã RA KHỎI BÃI không? Hành động này sẽ cập nhật CSDL.');">
+            <input type="hidden" name="db_id" value="{{ vehicle.db_id }}">
+            <button type="submit" class="delete-btn">Cho Ra</button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr>
+        <td colspan="5">Không có xe nào trong bãi.</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}
