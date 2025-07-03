@@ -8,12 +8,11 @@ STATUS_COMPLETED = 2
 STATUS_INVALID = 99
 
 # File paths
-ACCESS_LOG_FILE = "access_log.jsonl"
 ERROR_LOG_FILE = "error_log.txt"
-LOG_SYNC_STATE_FILE = "log_sync.state"
 
 # GPIO pins
-GREEN_LED_PIN = 16
+GREEN_LED_PIN = 23
+RED_LED_PIN = 24 # Assuming a red LED is on this pin
 
 # Event types
 EVENT_TYPE_IN = "IN"

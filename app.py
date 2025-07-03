@@ -12,7 +12,6 @@ from utils import get_vietnam_time_str
 # Constants
 PICTURE_FOLDER = os.getenv("PICTURE_OUTPUT_DIR", "picture")
 TMP_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
-LOG_FILE = "access_log.jsonl"
 DB_FILE = os.getenv("DB_FILE", "parking_data.db")
 DB_LOCK_FILE = DB_FILE + ".lock"
 

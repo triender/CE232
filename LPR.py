@@ -33,36 +33,11 @@ DB_ACCESS_LOCK = FileLock(DB_LOCK_FILE, timeout=15)
 CAMERA_LOCK = threading.Lock()
 VEHICLE_EVENT = threading.Event()
 SYNC_WORK_AVAILABLE = threading.Event()
-FAILURE_LOG_SYNC_AVAILABLE = threading.Event()
 LIVE_VIEW_THREAD_RUNNING = threading.Event()
 
 # --- Cài đặt GPIO ---
 
 # --- LOGGING FUNCTIONS ---
-def log_access(event_type: str, plate: str, rfid: str, status_event: str, 
-               image_paths_event: dict, timestamp_event: str, details: str = "", db_id: int = None) -> None:
-    """Log access events to JSONL file."""
-    log_entry = {
-        "timestamp": timestamp_event,
-        "event_type": event_type,
-        "plate": plate,
-        "rfid_token": str(rfid),
-        "status_event": status_event,
-        "image_paths": image_paths_event,
-        "details": details,
-        "device_db_id": db_id
-    }
-    try:
-        with open(ACCESS_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-        
-        # Trigger the failure log sync if it's a failure event
-        if event_type.startswith("FAIL"):
-            FAILURE_LOG_SYNC_AVAILABLE.set()
-
-    except Exception as e:
-        print(f"🔥 [LogAccess] Failed to write to access log: {e}")
-
 def log_error(message: str, category: str = "GENERAL", exception_obj: Exception = None) -> None:
     """Log error messages to error log file."""
     try:
@@ -126,12 +101,21 @@ def live_view_capture_thread(cap) -> None:
         time.sleep(0.5)
 
 
+def validate_environment_variables() -> bool:
+    """Check required environment variables."""
+    required_vars = [API_ENDPOINT, DB_FILE, IMAGE_DIR, PICTURE_OUTPUT_DIR, 
+                     YOLOV5_REPO_PATH, LP_DETECTOR_MODEL_PATH, LP_OCR_MODEL_PATH]
+    if not all(required_vars):
+        print("❌ Lỗi: Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.")
+        log_error("Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.", category="ENVIRONMENT")
+        return False
+    return True
+
 # --- VALIDATION ---
 if not validate_environment_variables():
     exit(1)
 
 try:
-    import function.utils_rotate as utils_rotate
     import function.helper as helper
     print("✅ Tải thành công các module helper tùy chỉnh.")
 except ImportError:
@@ -143,17 +127,8 @@ except ImportError:
             cls._plate_counter +=1
             if time.time() % 10 > 2:
                  return f"MOCK{int(time.time())%1000 + cls._plate_counter:04d}LP"
-            return "unknown"            helper = MockHelper()
-
-def validate_environment_variables() -> bool:
-    """Check required environment variables."""
-    required_vars = [API_ENDPOINT, DB_FILE, IMAGE_DIR, PICTURE_OUTPUT_DIR, 
-                     YOLOV5_REPO_PATH, LP_DETECTOR_MODEL_PATH, LP_OCR_MODEL_PATH]
-    if not all(required_vars):
-        print("❌ Lỗi: Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.")
-        log_error("Một hoặc nhiều biến môi trường quan trọng chưa được thiết lập trong file .env.", category="ENVIRONMENT")
-        return False
-    return True
+            return "unknown"
+    helper = MockHelper()
 
 def init_db() -> None:
     """Initialize SQLite database."""
@@ -312,79 +287,6 @@ def sync_offline_data_to_server():
             SYNC_WORK_AVAILABLE.clear() # Stop trying on critical error
             time.sleep(30)
 
-def sync_failure_logs_to_server():
-    """
-    Dedicated thread to read failure events from access_log.jsonl and send them to server.
-    """
-    while True:
-        try:
-            FAILURE_LOG_SYNC_AVAILABLE.wait(timeout=180.0) # Wait for signal or timeout every 3 mins
-            if VEHICLE_EVENT.is_set():
-                time.sleep(1)
-                continue
-
-            last_pos = 0
-            try:
-                with open(LOG_SYNC_STATE_FILE, "r") as f:
-                    last_pos = int(f.read())
-            except (FileNotFoundError, ValueError):
-                last_pos = 0
-
-            try:
-                with open(ACCESS_LOG_FILE, "r", encoding="utf-8") as f:
-                    f.seek(last_pos)
-                    
-                    while True: # Process all new lines
-                        current_pos = f.tell()
-                        line = f.readline()
-                        if not line:
-                            FAILURE_LOG_SYNC_AVAILABLE.clear() # No more work
-                            break
-
-                        try:
-                            log_entry = json.loads(line)
-                            # Only sync failure events through this mechanism
-                            if log_entry.get("event_type", "").startswith("FAIL"):
-                                print(f"🔄 [SyncLog] Xử lý log lỗi tại vị trí {current_pos}: {log_entry.get('status_event')}")
-                                
-                                # Thêm UID vào log nếu chưa có, đảm bảo server có thể định danh thiết bị
-                                if 'uid' not in log_entry:
-                                    log_entry['uid'] = UID
-
-                                # Hàm này mong muốn một dict, chúng ta đã có sẵn. Không có ảnh cho các sự kiện lỗi.
-                                result = send_event_to_server(log_entry)
-
-                                if result == 'success' or result == 'permanent_failure':
-                                    # Đối với log, ngay cả lỗi vĩnh viễn cũng có nghĩa là không thử lại. Chỉ cần di chuyển con trỏ.
-                                    with open(LOG_SYNC_STATE_FILE, "w") as state_f:
-                                        state_f.write(str(f.tell()))
-                                    print(f"✅ [SyncLog] Log tại vị trí {current_pos} đã được đánh dấu là đã đồng bộ (Kết quả: {result}).")
-                                else: # temporary_failure
-                                    print(f"⏳ [SyncLog] Temporary failure for log at pos {current_pos}. Will retry later.")
-                                    FAILURE_LOG_SYNC_AVAILABLE.clear() # Stop and wait before retrying
-                                    break # Exit the inner while loop
-                        except json.JSONDecodeError:
-                            print(f"⚠️ [SyncLog] Skipping malformed JSON line in access log at pos {current_pos}.")
-                            # Don't update position, just skip the line
-                            with open(LOG_SYNC_STATE_FILE, "w") as state_f:
-                                state_f.write(str(f.tell()))
-
-            except FileNotFoundError:
-                FAILURE_LOG_SYNC_AVAILABLE.clear() # Log file doesn't exist yet
-                continue
-            except Exception as e_inner:
-                 print(f"🔥 [SyncLog] Error processing log file: {e_inner}")
-                 log_error("Error processing log file in sync thread", "SYNC_LOG", e_inner)
-                 FAILURE_LOG_SYNC_AVAILABLE.clear()
-                 time.sleep(30)
-
-        except Exception as e:
-            print(f"🔥 [SyncLog] Critical error in failure log sync thread: {e}")
-            log_error("Critical error in failure log sync thread", category="SYNC_LOG", exception_obj=e)
-            FAILURE_LOG_SYNC_AVAILABLE.clear()
-            time.sleep(30)
-
-
 def _save_vehicle_images(base_filename_part, event_type, original_frame, cropped_frame=None):
     """
     Hàm helper để lưu ảnh gốc và ảnh cắt vào thư mục picture.
@@ -472,7 +374,6 @@ def _process_vehicle_event(rfid_id, cap):
                 print("❌ [AI] Không nhận dạng được biển số hợp lệ.")
                 log_error(f"Không nhận dạng được biển số hợp lệ. RFID: {rfid_id}, Raw Plate: {found_license_plate_text}", category="AI/VALIDATION")
                 # Không lưu ảnh vì không có biển số để đặt tên file
-                log_access("FAIL_IN" if vehicle_inside_record is None else "FAIL_OUT", found_license_plate_text, rfid_id, "NO_PLATE_DETECTED", {}, get_vietnam_time_str())
                 return # Kết thúc xử lý cho sự kiện này
 
             print(f"🎉 [AI] Phát hiện biển số: '{found_license_plate_text}' -> Chuẩn hóa: '{normalized_plate}'")
@@ -489,8 +390,7 @@ def _process_vehicle_event(rfid_id, cap):
                 if is_plate_already_inside:
                     print(f"🚨 [Logic] Xác thực THẤT BẠI: Biển số '{normalized_plate}' đã được ghi nhận ở trong bãi với một thẻ khác.")
                     log_error(f"Xác thực THẤT BẠI VÀO: Biển số '{normalized_plate}' (RFID: {rfid_id}) đã ở trong bãi với thẻ khác.", category="LOGIC/VALIDATION")
-                    image_paths = _save_vehicle_images(normalized_plate, "in_fail", original_frame_to_save, cropped_license_plate_img)
-                    log_access("FAIL_IN", normalized_plate, rfid_id, "ALREADY_INSIDE_DIFF_RFID", image_paths, get_vietnam_time_str(), details="Plate already inside with different RFID")
+                    _save_vehicle_images(normalized_plate, "in_fail", original_frame_to_save, cropped_license_plate_img)
                 else:
                     print(f"✅ [Logic] Xác thực THÀNH CÔNG: Biển số '{normalized_plate}' hợp lệ để vào.")
                     current_time_str = get_vietnam_time_str()
@@ -503,7 +403,6 @@ def _process_vehicle_event(rfid_id, cap):
                         last_id = cursor.lastrowid
                         conn.commit()
                         print(f"💾 [DB] Sự kiện VÀO đã được lưu cục bộ. ID: {last_id}")
-                        log_access("IN", normalized_plate, rfid_id, "SUCCESS", image_paths, current_time_str, details=f"DB_ID: {last_id}", db_id=last_id)
                         blink_success_led()
 
             # XE RA
@@ -519,7 +418,6 @@ def _process_vehicle_event(rfid_id, cap):
                 if normalized_plate != plate_in_db:
                     print(f"🚨 [Logic] Cảnh báo An ninh: Biển số ra '{normalized_plate}' KHÔNG KHỚP biển số vào '{plate_in_db}'. Từ chối cho ra.")
                     log_error(f"Cảnh báo An ninh RA: Biển số ra '{normalized_plate}' (RFID: {rfid_id}) KHÔNG KHỚP biển vào '{plate_in_db}'.", category="LOGIC/SECURITY")
-                    log_access("FAIL_OUT", normalized_plate, rfid_id, "PLATE_MISMATCH", image_paths, current_time_str, details=f"Plate mismatch. DB plate: {plate_in_db}", db_id=db_id_in)
                 else:
                     print(f"✅ [Logic] Xác thực THÀNH CÔNG: Biển số '{normalized_plate}' khớp. Cho phép xe ra.")
                     with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
@@ -528,7 +426,6 @@ def _process_vehicle_event(rfid_id, cap):
                                         (current_time_str, image_paths.get("raw"), STATUS_COMPLETED, 0, db_id_in))
                         conn.commit()
                         print(f"💾 [DB] Sự kiện RA đã được cập nhật cục bộ cho ID: {db_id_in}")
-                        log_access("OUT", normalized_plate, rfid_id, "SUCCESS", image_paths, current_time_str, details=f"DB_ID: {db_id_in}", db_id=db_id_in)
                         blink_success_led()
             
             # Sau mỗi sự kiện, dù thành công hay thất bại, đều trigger luồng sync
@@ -572,29 +469,15 @@ except Exception as e:
 
 VEHICLE_EVENT.clear()
 SYNC_WORK_AVAILABLE.clear()
-FAILURE_LOG_SYNC_AVAILABLE.clear()
 with DB_ACCESS_LOCK:
     with sqlite3.connect(DB_FILE) as conn:
         if conn.execute("SELECT 1 FROM parking_log WHERE synced_to_server = 0 LIMIT 1").fetchone():
             print("   [Main] Phát hiện dữ liệu cũ chưa đồng bộ. Bật tín hiệu cho luồng sync DB.")
             SYNC_WORK_AVAILABLE.set()
 
-# Check for unsynced failure logs on startup
-try:
-    if os.path.exists(ACCESS_LOG_FILE):
-        print("   [Main] Kiểm tra file log lỗi chưa đồng bộ...")
-        FAILURE_LOG_SYNC_AVAILABLE.set()
-except Exception as e:
-    print(f"   [Main] Không thể kiểm tra file log lỗi: {e}")
-
-
 sync_thread = threading.Thread(target=sync_offline_data_to_server, daemon=True)
 sync_thread.start()
 print("🚀 [Main] Đã khởi động luồng đồng bộ CSDL theo tín hiệu.")
-
-failure_sync_thread = threading.Thread(target=sync_failure_logs_to_server, daemon=True)
-failure_sync_thread.start()
-print("🚀 [Main] Đã khởi động luồng đồng bộ file log lỗi.")
 
 # --- LIVE VIEW THREAD ---
 print("🚀 [Main] Khởi động luồng xem camera trực tiếp...")
